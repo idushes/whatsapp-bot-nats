@@ -19,7 +19,7 @@ go run .
 | `WEBHOOK_VERIFY_TOKEN` | Токен верификации webhook (настраивается в Meta Dashboard)   | —                       |
 | `APP_SECRET`           | Facebook App Secret для HMAC SHA256 валидации подписи        | —                       |
 | `PORT`                 | Порт HTTP-сервера                                            | `8080`                  |
-| `API_VERSION`          | Версия Graph API                                             | `v21.0`                 |
+| `API_VERSION`          | Версия Graph API                                             | `v25.0`                 |
 
 Можно указать несколько аккаунтов:
 
@@ -138,7 +138,7 @@ nats req "whatsapp.my_account.out.raw" '{"body": {"messaging_product":"whatsapp"
 }
 ```
 
-> Для скачивания медиа используйте Media API: `GET https://graph.facebook.com/v21.0/{media_id}`
+> Для скачивания медиа используйте Media API: `GET https://graph.facebook.com/v25.0/{media_id}`
 
 ### Документ
 

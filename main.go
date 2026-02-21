@@ -69,23 +69,23 @@ type ProfileInfo struct {
 }
 
 type Message struct {
-	From      string           `json:"from"`
-	ID        string           `json:"id"`
-	Timestamp string           `json:"timestamp"`
-	Type      string           `json:"type"`
-	Text      *TextContent     `json:"text,omitempty"`
-	Image     *MediaContent    `json:"image,omitempty"`
-	Video     *MediaContent    `json:"video,omitempty"`
-	Audio     *MediaContent    `json:"audio,omitempty"`
-	Document  *DocumentContent `json:"document,omitempty"`
-	Sticker   *MediaContent    `json:"sticker,omitempty"`
-	Location  *LocationContent `json:"location,omitempty"`
-	Contacts  []ContactCard    `json:"contacts,omitempty"`
-	Button    *ButtonContent   `json:"button,omitempty"`
-	Context   *ContextInfo     `json:"context,omitempty"`
-	Reaction  *ReactionContent `json:"reaction,omitempty"`
+	From        string           `json:"from"`
+	ID          string           `json:"id"`
+	Timestamp   string           `json:"timestamp"`
+	Type        string           `json:"type"`
+	Text        *TextContent     `json:"text,omitempty"`
+	Image       *MediaContent    `json:"image,omitempty"`
+	Video       *MediaContent    `json:"video,omitempty"`
+	Audio       *MediaContent    `json:"audio,omitempty"`
+	Document    *DocumentContent `json:"document,omitempty"`
+	Sticker     *MediaContent    `json:"sticker,omitempty"`
+	Location    *LocationContent `json:"location,omitempty"`
+	Contacts    []ContactCard    `json:"contacts,omitempty"`
+	Button      *ButtonContent   `json:"button,omitempty"`
+	Context     *ContextInfo     `json:"context,omitempty"`
+	Reaction    *ReactionContent `json:"reaction,omitempty"`
 	Interactive *json.RawMessage `json:"interactive,omitempty"`
-	Errors    []WAError        `json:"errors,omitempty"`
+	Errors      []WAError        `json:"errors,omitempty"`
 }
 
 type TextContent struct {
@@ -166,7 +166,7 @@ func main() {
 	port := env("PORT", "8080")
 	verifyToken := os.Getenv("WEBHOOK_VERIFY_TOKEN")
 	appSecret := os.Getenv("APP_SECRET")
-	apiVersion := env("API_VERSION", "v21.0")
+	apiVersion := env("API_VERSION", "v25.0")
 
 	// Discover accounts from WA_* env vars
 	accounts := discoverAccounts()
@@ -561,9 +561,9 @@ func wrapTextMessage(data []byte) []byte {
 		To   string `json:"to"`
 		Text string `json:"text"`
 		// Optional fields
-		PreviewURL       *bool            `json:"preview_url,omitempty"`
-		Context          *ContextInfo     `json:"context,omitempty"`
-		ReplyTo          string           `json:"reply_to,omitempty"`
+		PreviewURL *bool        `json:"preview_url,omitempty"`
+		Context    *ContextInfo `json:"context,omitempty"`
+		ReplyTo    string       `json:"reply_to,omitempty"`
 	}
 	if err := json.Unmarshal(data, &req); err != nil {
 		return data // fallback to raw
