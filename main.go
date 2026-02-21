@@ -335,18 +335,32 @@ func handleIncoming(w http.ResponseWriter, r *http.Request, nc *nats.Conn, accou
 	// Process entries
 	for _, entry := range payload.Entry {
 		for _, change := range entry.Changes {
-			if change.Field != "messages" {
-				continue
-			}
+			switch change.Field {
+			case "messages":
+				phoneID := change.Value.Metadata.PhoneNumberID
+				acct, ok := accountByPhone[phoneID]
+				if !ok {
+					log.Printf("Unknown phone_number_id: %s", phoneID)
+					continue
+				}
+				publishEvents(nc, acct, change.Value, body)
 
-			phoneID := change.Value.Metadata.PhoneNumberID
-			acct, ok := accountByPhone[phoneID]
-			if !ok {
-				log.Printf("Unknown phone_number_id: %s", phoneID)
-				continue
-			}
+			case "account_update", "business_status_update", "phone_number_quality_update":
+				// Account-level events — publish raw change value to whatsapp.event.<field>
+				changeData, err := json.Marshal(change.Value)
+				if err != nil {
+					log.Printf("marshal %s: %v", change.Field, err)
+					continue
+				}
+				subject := "whatsapp.event." + change.Field
+				if err := nc.Publish(subject, changeData); err != nil {
+					log.Printf("publish %s: %v", subject, err)
+				}
+				log.Printf("← %s (entry=%s)", change.Field, entry.ID)
 
-			publishEvents(nc, acct, change.Value, body)
+			default:
+				log.Printf("Unhandled webhook field: %s", change.Field)
+			}
 		}
 	}
 }
