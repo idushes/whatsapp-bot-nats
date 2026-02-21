@@ -28,6 +28,14 @@ WA_MY_ACCOUNT=123456789:EAABx...
 WA_SUPPORT=987654321:EAABy...
 ```
 
+## HTTP Endpoints
+
+| Метод  | Путь       | Описание                                            |
+| ------ | ---------- | --------------------------------------------------- |
+| `GET`  | `/webhook` | Верификация вебхука (Meta `hub.challenge`)          |
+| `POST` | `/webhook` | Приём входящих событий от WhatsApp (HMAC-валидация) |
+| `GET`  | `/health`  | Health check — возвращает `200 OK` с телом `ok`     |
+
 ## Настройка в Meta Dashboard
 
 1. Создайте приложение на [developers.facebook.com](https://developers.facebook.com/)
