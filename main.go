@@ -290,14 +290,18 @@ func handleVerification(w http.ResponseWriter, r *http.Request, verifyToken stri
 	token := r.URL.Query().Get("hub.verify_token")
 	challenge := r.URL.Query().Get("hub.challenge")
 
+	log.Printf("Webhook verification request: URL=%s mode=%q token=%q challenge=%q configured_token_len=%d",
+		r.URL.String(), mode, token, challenge, len(verifyToken))
+
 	if mode == "subscribe" && token == verifyToken {
-		log.Printf("Webhook verified")
+		log.Printf("Webhook verified successfully")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(challenge))
 		return
 	}
 
-	log.Printf("Webhook verification failed: mode=%s token_match=%v", mode, token == verifyToken)
+	log.Printf("Webhook verification failed: mode=%q token_match=%v (got_len=%d, want_len=%d)",
+		mode, token == verifyToken, len(token), len(verifyToken))
 	http.Error(w, "forbidden", http.StatusForbidden)
 }
 
