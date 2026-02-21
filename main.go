@@ -591,7 +591,7 @@ func handleOutgoing(js jetstream.JetStream, acct Account, msg jetstream.Msg, api
 			"type":    apiResp.Error.Type,
 			"request": json.RawMessage(payload),
 		})
-		errSubject := fmt.Sprintf("whatsapp.%s.error", acct.Name)
+		errSubject := fmt.Sprintf("whatsapp.%s.out.error", acct.Name)
 		if _, pubErr := js.Publish(context.Background(), errSubject, errPayload); pubErr != nil {
 			log.Printf("[%s] publish error event: %v", acct.Name, pubErr)
 		}
