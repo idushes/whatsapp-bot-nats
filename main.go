@@ -19,6 +19,7 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // Account — one WhatsApp Business account instance.
@@ -167,6 +168,7 @@ func main() {
 	verifyToken := os.Getenv("WEBHOOK_VERIFY_TOKEN")
 	appSecret := os.Getenv("APP_SECRET")
 	apiVersion := env("API_VERSION", "v25.0")
+	consumerPrefix := env("CONSUMER_NAME", "whatsapp")
 
 	// Discover accounts from WA_* env vars
 	accounts := discoverAccounts()
@@ -183,6 +185,14 @@ func main() {
 	}
 	defer nc.Close()
 
+	// JetStream context
+	js, err := jetstream.New(nc)
+	if err != nil {
+		log.Fatalf("JetStream: %v", err)
+	}
+
+	ctx := context.Background()
+
 	// Build account lookup by phone_number_id
 	accountByPhone := make(map[string]Account, len(accounts))
 
@@ -190,22 +200,45 @@ func main() {
 		a := acct
 		log.Printf("[%s] phone_number_id=%s", a.Name, a.PhoneNumberID)
 
-		// Subscribe to outgoing subjects: whatsapp.<name>.out.>
+		// Create durable consumer for outgoing messages
 		subject := fmt.Sprintf("whatsapp.%s.out.>", a.Name)
-		_, err := nc.Subscribe(subject, func(msg *nats.Msg) {
-			handleOutgoing(nc, a, msg, apiVersion)
+		consumerName := fmt.Sprintf("%s-%s-out", consumerPrefix, a.Name)
+
+		// Find stream by subject
+		streamName, err := js.StreamNameBySubject(ctx, fmt.Sprintf("whatsapp.%s.out.sendMessage", a.Name))
+		if err != nil {
+			log.Fatalf("[%s] find stream for %s: %v", a.Name, subject, err)
+		}
+
+		stream, err := js.Stream(ctx, streamName)
+		if err != nil {
+			log.Fatalf("[%s] get stream %s: %v", a.Name, streamName, err)
+		}
+
+		cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+			Name:          consumerName,
+			Durable:       consumerName,
+			FilterSubject: subject,
+			AckPolicy:     jetstream.AckExplicitPolicy,
 		})
 		if err != nil {
-			log.Fatalf("[%s] subscribe %s: %v", a.Name, subject, err)
+			log.Fatalf("[%s] create consumer %s: %v", a.Name, consumerName, err)
 		}
-		log.Printf("[%s] subscribed to %s", a.Name, subject)
+
+		_, err = cons.Consume(func(msg jetstream.Msg) {
+			handleOutgoing(js, a, msg, apiVersion)
+		})
+		if err != nil {
+			log.Fatalf("[%s] consume %s: %v", a.Name, consumerName, err)
+		}
+		log.Printf("[%s] consumer %s on stream %s (filter: %s)", a.Name, consumerName, streamName, subject)
 
 		accountByPhone[a.PhoneNumberID] = a
 	}
 
 	// HTTP server
 	mux := http.NewServeMux()
-	mux.HandleFunc("/webhook", makeWebhookHandler(nc, accountByPhone, verifyToken, appSecret))
+	mux.HandleFunc("/webhook", makeWebhookHandler(js, accountByPhone, verifyToken, appSecret))
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
@@ -271,13 +304,13 @@ func discoverAccounts() []Account {
 
 // makeWebhookHandler returns an HTTP handler for WhatsApp webhooks.
 // Handles both GET (verification) and POST (incoming events).
-func makeWebhookHandler(nc *nats.Conn, accountByPhone map[string]Account, verifyToken, appSecret string) http.HandlerFunc {
+func makeWebhookHandler(js jetstream.JetStream, accountByPhone map[string]Account, verifyToken, appSecret string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			handleVerification(w, r, verifyToken)
 		case http.MethodPost:
-			handleIncoming(w, r, nc, accountByPhone, appSecret)
+			handleIncoming(w, r, js, accountByPhone, appSecret)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
@@ -306,7 +339,7 @@ func handleVerification(w http.ResponseWriter, r *http.Request, verifyToken stri
 }
 
 // handleIncoming handles incoming WhatsApp webhook events (POST /webhook).
-func handleIncoming(w http.ResponseWriter, r *http.Request, nc *nats.Conn, accountByPhone map[string]Account, appSecret string) {
+func handleIncoming(w http.ResponseWriter, r *http.Request, js jetstream.JetStream, accountByPhone map[string]Account, appSecret string) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read body", http.StatusBadRequest)
@@ -343,7 +376,7 @@ func handleIncoming(w http.ResponseWriter, r *http.Request, nc *nats.Conn, accou
 					log.Printf("Unknown phone_number_id: %s", phoneID)
 					continue
 				}
-				publishEvents(nc, acct, change.Value, body)
+				publishEvents(js, acct, change.Value, body)
 
 			case "account_update", "business_status_update", "phone_number_quality_update":
 				// Account-level events — publish raw change value to whatsapp.event.<field>
@@ -353,7 +386,7 @@ func handleIncoming(w http.ResponseWriter, r *http.Request, nc *nats.Conn, accou
 					continue
 				}
 				subject := "whatsapp.event." + change.Field
-				if err := nc.Publish(subject, changeData); err != nil {
+				if _, err := js.Publish(context.Background(), subject, changeData); err != nil {
 					log.Printf("publish %s: %v", subject, err)
 				}
 				log.Printf("← %s (entry=%s)", change.Field, entry.ID)
@@ -387,12 +420,13 @@ func validateSignature(body []byte, signature, appSecret string) bool {
 	return hmac.Equal(sig, expected)
 }
 
-// publishEvents publishes webhook events to NATS subjects.
-func publishEvents(nc *nats.Conn, acct Account, value ChangeValue, rawPayload []byte) {
+// publishEvents publishes webhook events to JetStream subjects.
+func publishEvents(js jetstream.JetStream, acct Account, value ChangeValue, rawPayload []byte) {
+	ctx := context.Background()
 	prefix := fmt.Sprintf("whatsapp.%s.in", acct.Name)
 
 	// Always publish full webhook payload
-	if err := nc.Publish(prefix+".webhook", rawPayload); err != nil {
+	if _, err := js.Publish(ctx, prefix+".webhook", rawPayload); err != nil {
 		log.Printf("[%s] publish webhook: %v", acct.Name, err)
 	}
 
@@ -405,13 +439,13 @@ func publishEvents(nc *nats.Conn, acct Account, value ChangeValue, rawPayload []
 		}
 
 		// Publish to in.message
-		if err := nc.Publish(prefix+".message", data); err != nil {
+		if _, err := js.Publish(ctx, prefix+".message", data); err != nil {
 			log.Printf("[%s] publish message: %v", acct.Name, err)
 		}
 
 		// Also publish to type-specific subject: in.message.<type>
 		if msg.Type != "" {
-			if err := nc.Publish(prefix+".message."+msg.Type, data); err != nil {
+			if _, err := js.Publish(ctx, prefix+".message."+msg.Type, data); err != nil {
 				log.Printf("[%s] publish message.%s: %v", acct.Name, msg.Type, err)
 			}
 		}
@@ -427,7 +461,7 @@ func publishEvents(nc *nats.Conn, acct Account, value ChangeValue, rawPayload []
 			continue
 		}
 
-		if err := nc.Publish(prefix+".status", data); err != nil {
+		if _, err := js.Publish(ctx, prefix+".status", data); err != nil {
 			log.Printf("[%s] publish status: %v", acct.Name, err)
 		}
 
@@ -440,20 +474,20 @@ func publishEvents(nc *nats.Conn, acct Account, value ChangeValue, rawPayload []
 		if err != nil {
 			continue
 		}
-		if err := nc.Publish(prefix+".error", data); err != nil {
+		if _, err := js.Publish(ctx, prefix+".error", data); err != nil {
 			log.Printf("[%s] publish error: %v", acct.Name, err)
 		}
 		log.Printf("[%s] ← error %d: %s", acct.Name, waErr.Code, waErr.Title)
 	}
 }
 
-// handleOutgoing handles NATS messages on whatsapp.<name>.out.* subjects.
-func handleOutgoing(nc *nats.Conn, acct Account, msg *nats.Msg, apiVersion string) {
+// handleOutgoing handles JetStream messages on whatsapp.<name>.out.* subjects.
+func handleOutgoing(js jetstream.JetStream, acct Account, msg jetstream.Msg, apiVersion string) {
 	// Extract action from subject: whatsapp.<name>.out.<action>
-	parts := strings.Split(msg.Subject, ".")
+	parts := strings.Split(msg.Subject(), ".")
 	if len(parts) < 4 {
-		log.Printf("[%s] bad out subject: %s", acct.Name, msg.Subject)
-		respondError(msg, "invalid subject format")
+		log.Printf("[%s] bad out subject: %s", acct.Name, msg.Subject())
+		msg.Term() // malformed subject, don't retry
 		return
 	}
 	action := parts[3]
@@ -467,9 +501,9 @@ func handleOutgoing(nc *nats.Conn, acct Account, msg *nats.Msg, apiVersion strin
 	case "raw":
 		// Raw: allows custom path and body
 		var raw RawRequest
-		if err := json.Unmarshal(msg.Data, &raw); err != nil {
+		if err := json.Unmarshal(msg.Data(), &raw); err != nil {
 			log.Printf("[%s] bad raw request: %v", acct.Name, err)
-			respondError(msg, fmt.Sprintf("bad raw request: %v", err))
+			msg.Term() // bad payload, don't retry
 			return
 		}
 		if raw.Path != "" {
@@ -481,59 +515,59 @@ func handleOutgoing(nc *nats.Conn, acct Account, msg *nats.Msg, apiVersion strin
 
 	case "sendMessage":
 		apiURL = baseURL + "/messages"
-		payload = wrapTextMessage(msg.Data)
+		payload = wrapTextMessage(msg.Data())
 
 	case "sendImage":
 		apiURL = baseURL + "/messages"
-		payload = wrapMediaMessage(msg.Data, "image")
+		payload = wrapMediaMessage(msg.Data(), "image")
 
 	case "sendDocument":
 		apiURL = baseURL + "/messages"
-		payload = wrapMediaMessage(msg.Data, "document")
+		payload = wrapMediaMessage(msg.Data(), "document")
 
 	case "sendVideo":
 		apiURL = baseURL + "/messages"
-		payload = wrapMediaMessage(msg.Data, "video")
+		payload = wrapMediaMessage(msg.Data(), "video")
 
 	case "sendAudio":
 		apiURL = baseURL + "/messages"
-		payload = wrapMediaMessage(msg.Data, "audio")
+		payload = wrapMediaMessage(msg.Data(), "audio")
 
 	case "sendLocation":
 		apiURL = baseURL + "/messages"
-		payload = wrapLocationMessage(msg.Data)
+		payload = wrapLocationMessage(msg.Data())
 
 	case "sendContact":
 		apiURL = baseURL + "/messages"
-		payload = wrapContactMessage(msg.Data)
+		payload = wrapContactMessage(msg.Data())
 
 	case "sendTemplate":
 		apiURL = baseURL + "/messages"
-		payload = wrapTemplateMessage(msg.Data)
+		payload = wrapTemplateMessage(msg.Data())
 
 	case "sendReaction":
 		apiURL = baseURL + "/messages"
-		payload = wrapReactionMessage(msg.Data)
+		payload = wrapReactionMessage(msg.Data())
 
 	case "markRead":
 		apiURL = baseURL + "/messages"
-		payload = wrapMarkRead(msg.Data)
+		payload = wrapMarkRead(msg.Data())
 
 	case "sendSticker":
 		apiURL = baseURL + "/messages"
-		payload = wrapMediaMessage(msg.Data, "sticker")
+		payload = wrapMediaMessage(msg.Data(), "sticker")
 
 	default:
 		// Any unknown action → direct post to /messages with the data as-is
 		apiURL = baseURL + "/messages"
-		payload = msg.Data
+		payload = msg.Data()
 	}
 
 	// Call WhatsApp Cloud API
 	result, err := callWhatsAppAPI(apiURL, acct.AccessToken, payload)
 	if err != nil {
 		log.Printf("[%s] API %s error: %v", acct.Name, action, err)
-		respondError(msg, fmt.Sprintf("API error: %v", err))
+		msg.Nak() // network error, retry later
 		return
 	}
 
@@ -549,7 +583,7 @@ func handleOutgoing(nc *nats.Conn, acct Account, msg *nats.Msg, apiVersion strin
 	if err := json.Unmarshal(result, &apiResp); err == nil && apiResp.Error != nil {
 		log.Printf("[%s] → %s FAIL [%d] %s", acct.Name, action, apiResp.Error.Code, apiResp.Error.Message)
 
-		// Publish error to NATS stream
+		// Publish error to JetStream
 		errPayload, _ := json.Marshal(map[string]interface{}{
 			"action":  action,
 			"code":    apiResp.Error.Code,
@@ -558,17 +592,15 @@ func handleOutgoing(nc *nats.Conn, acct Account, msg *nats.Msg, apiVersion strin
 			"request": json.RawMessage(payload),
 		})
 		errSubject := fmt.Sprintf("whatsapp.%s.error", acct.Name)
-		if pubErr := nc.Publish(errSubject, errPayload); pubErr != nil {
+		if _, pubErr := js.Publish(context.Background(), errSubject, errPayload); pubErr != nil {
 			log.Printf("[%s] publish error event: %v", acct.Name, pubErr)
 		}
 	} else {
 		log.Printf("[%s] → %s OK", acct.Name, action)
 	}
 
-	// Reply if request/reply pattern
-	if msg.Reply != "" {
-		msg.Respond(result)
-	}
+	// Ack: message processed (whether API succeeded or returned a business error)
+	msg.Ack()
 }
 
 // --- Message wrapping helpers ---
@@ -793,16 +825,6 @@ func callWhatsAppAPI(url, accessToken string, payload []byte) ([]byte, error) {
 	}
 
 	return body, nil
-}
-
-// respondError sends an error response if reply subject is set.
-func respondError(msg *nats.Msg, errMsg string) {
-	if msg.Reply == "" {
-		return
-	}
-	resp := map[string]string{"error": errMsg}
-	data, _ := json.Marshal(resp)
-	msg.Respond(data)
 }
 
 func env(key, fallback string) string {
